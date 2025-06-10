@@ -9,7 +9,7 @@ export function MintNFT() {
   const { data, write } = useContractWrite({
     address: CONTRACT_ADDRESS,
     abi: ABI,
-    functionName: "mint", // update this if your function name is different
+    functionName: "mint",
   });
 
   const { isLoading, isSuccess } = useWaitForTransaction({ hash: data?.hash });
