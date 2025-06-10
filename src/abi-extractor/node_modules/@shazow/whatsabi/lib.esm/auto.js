@@ -1,0 +1,290 @@
+import * as AbiFunction from 'ox/AbiFunction';
+import * as AbiEvent from 'ox/AbiEvent';
+import { DiamondProxyResolver } from "./proxies.js";
+import * as errors from "./errors.js";
+import { CompatibleProvider } from "./providers.js";
+import { defaultABILoader, defaultSignatureLookup } from "./loaders.js";
+import { abiFromBytecode, disasm } from "./disasm.js";
+import { MultiABILoader } from "./loaders.js";
+/// Magic number we use to determine whether a proxy is reasonably a destination contract or not.
+/// If it has many SSTORE's then it's probably doing something other than proxying.
+const PROXY_SSTORE_COUNT_MAX = 4;
+function isAddress(address) {
+    return address.length === 42 && address.startsWith("0x") && Number(address) >= 0;
+}
+export const defaultConfig = {
+    onProgress: (_) => { },
+    onError: (phase, err) => { console.error(phase + ":", err); return false; },
+};
+/**
+ * autoload is a convenience helper for doing All The Things to load an ABI of a contract address, including resolving proxies.
+ * @param address - The address of the contract to load
+ * @param config - the {@link AutoloadConfig} object
+ * @example
+ * ```typescript
+ * import { ethers } from "ethers";
+ * import { whatsabi } from "@shazow/whatsabi";
+ *
+ * const provider = ethers.getDefaultProvider(); // substitute with your fav provider
+ * const address = "0x00000000006c3852cbEf3e08E8dF289169EdE581"; // Or your fav contract address
+ *
+ * // Quick-start:
+ *
+ * const result = await whatsabi.autoload(address, { provider });
+ * console.log(result.abi);
+ * // -> [ ... ]
+ * ```
+ * @example
+ * See {@link AutoloadConfig} for additional features that can be enabled.
+ * ```typescript
+ * const result = await whatsabi.autoload(address, {
+ *   provider,
+ *   followProxies: true,
+ *   loadContractResult: true, // Load full contract metadata (slower)
+ *   enableExperimentalMetadata: true, // Include less reliable static analysis results (e.g. event topics)
+ *   // and more! See AutoloadConfig for all the options.
+ * });
+ * ```
+ */
+export async function autoload(address, config) {
+    if (config === undefined) {
+        throw new errors.AutoloadError("config is undefined, must include 'provider'");
+    }
+    const onProgress = config.onProgress || defaultConfig.onProgress;
+    const onError = config.onError || defaultConfig.onError;
+    const provider = CompatibleProvider(config.provider);
+    const result = {
+        address,
+        abi: [],
+        proxies: [],
+        hasCode: false,
+    };
+    let abiLoader = config.abiLoader;
+    if (abiLoader === undefined)
+        abiLoader = defaultABILoader;
+    if (!isAddress(address)) {
+        onProgress("resolveName", { address });
+        if (config.addressResolver) {
+            address = await config.addressResolver(address);
+        }
+        else {
+            try {
+                address = await provider.getAddress(address);
+            }
+            catch (err) {
+                throw new errors.AutoloadError(`Failed to resolve ENS address using provider.getAddress, try supplying your own resolver in AutoloadConfig by specifying addressResolver`, {
+                    context: { address },
+                    cause: err,
+                });
+            }
+        }
+    }
+    // Load code, we need to disasm to find proxies
+    onProgress("getCode", { address });
+    let bytecode;
+    try {
+        bytecode = await provider.getCode(address);
+    }
+    catch (err) {
+        throw new errors.AutoloadError(`Failed to fetch contract code due to provider error: ${err instanceof Error ? err.message : String(err)}`, {
+            context: { address },
+            cause: err,
+        });
+    }
+    if (!bytecode || bytecode === "0x")
+        return result; // Must be an EOA
+    result.hasCode = true;
+    const program = disasm(bytecode);
+    result.proxies = program.proxies; // FIXME: Sort them in some reasonable way
+    result.isFactory = program.isFactory;
+    // Mapping of address-to-valid-selectors. Non-empty mapping values will prune ABIs to the selectors before returning.
+    // This is mainly to support multiple proxies and diamond proxies.
+    const facets = {
+        [address]: [],
+    };
+    if (result.proxies.length === 1 && result.proxies[0] instanceof DiamondProxyResolver) {
+        // TODO: Respect config.followProxies, see https://github.com/shazow/whatsabi/issues/132
+        onProgress("loadDiamondFacets", { address });
+        const diamondProxy = result.proxies[0];
+        const f = await diamondProxy.facets(provider, address);
+        Object.assign(facets, f);
+    }
+    else if (result.proxies.length > 0 && program.sstoreCount <= PROXY_SSTORE_COUNT_MAX) {
+        result.followProxies = async function (selector) {
+            // This attempts to follow the first proxy that resolves successfully.
+            // FIXME: If there are multiple proxies, should we attempt to merge them somehow?
+            for (const resolver of result.proxies) {
+                onProgress("followProxies", { resolver: resolver, address });
+                const resolved = await resolver.resolve(provider, address, selector);
+                if (resolved !== undefined)
+                    return await autoload(resolved, config);
+            }
+            onError("followProxies", new Error("failed to resolve proxy"));
+            return result;
+        };
+        if (config.followProxies) {
+            return await result.followProxies();
+        }
+    }
+    if (abiLoader) {
+        // Attempt to load the ABI from a contract database, if exists
+        onProgress("abiLoader", { address, facets: Object.keys(facets) });
+        const loader = abiLoader;
+        let abiLoadedFrom = loader;
+        let originalOnLoad;
+        if (loader instanceof MultiABILoader) {
+            // This is a workaround for avoiding to change the loadABI signature, we can remove it if we use getContract instead.
+            const onLoad = (loader) => {
+                abiLoadedFrom = loader;
+            };
+            originalOnLoad = loader.onLoad;
+            if (!loader.onLoad)
+                loader.onLoad = onLoad;
+            else {
+                // Just in case someone uses this feature, let's wrap it to include both. Not ideal... Is there a better way here?
+                const original = loader.onLoad;
+                loader.onLoad = (loader) => { original(loader); onLoad(loader); };
+            }
+        }
+        try {
+            if (config.loadContractResult) {
+                const contractResult = await loader.getContract(address);
+                if (contractResult && Array.isArray(contractResult.abi) && contractResult.abi.length > 0) {
+                    // We assume that a verified contract ABI contains all of the relevant resolved proxy functions
+                    // so we don't need to mess with resolving facets and can return immediately.
+                    result.contractResult = contractResult;
+                    result.abi = contractResult.abi;
+                    result.abiLoadedFrom = contractResult.loader;
+                    return result;
+                }
+            }
+            else {
+                // Load ABIs of all available facets and merge
+                const addresses = Object.keys(facets);
+                const promises = addresses.map(addr => loader.loadABI(addr));
+                const results = await Promise.all(promises);
+                const abis = Object.fromEntries(results.map((abi, i) => {
+                    return [addresses[i], abi];
+                }));
+                result.abi = pruneFacets(facets, abis);
+                if (result.abi.length > 0) {
+                    result.abiLoadedFrom = abiLoadedFrom;
+                    return result;
+                }
+            }
+        }
+        catch (error) {
+            // TODO: Catch useful errors
+            if (onError("abiLoader", error) === true)
+                return result;
+        }
+        finally {
+            if (loader instanceof MultiABILoader) {
+                loader.onLoad = originalOnLoad;
+            }
+        }
+    }
+    // Load from code
+    onProgress("abiFromBytecode", { address });
+    result.abi = abiFromBytecode(program);
+    if (!config.enableExperimentalMetadata) {
+        result.abi = stripUnreliableABI(result.abi);
+    }
+    // Add any extra ABIs we found from facets
+    result.abi.push(...Object.values(facets).flat().map(selector => {
+        return {
+            type: "function",
+            selector,
+        };
+    }));
+    let signatureLookup = config.signatureLookup;
+    if (signatureLookup === undefined)
+        signatureLookup = defaultSignatureLookup;
+    if (!signatureLookup)
+        return result; // Bail
+    // Load signatures from a database
+    onProgress("signatureLookup", { abiItems: result.abi.length });
+    let promises = [];
+    for (const a of result.abi) {
+        if (a.type === "function") {
+            promises.push(signatureLookup.loadFunctions(a.selector).then((r) => {
+                if (r.length >= 1) {
+                    a.sig = r[0];
+                    // Extract as much metadata as it can from the signature
+                    const extracted = AbiFunction.from("function " + a.sig, { prepare: false });
+                    if (extracted.outputs.length === 0) {
+                        // Outputs not included in signature databases -_- (unless something changed)
+                        // Let whatsabi keep its best guess, if any.
+                        delete (extracted.outputs);
+                    }
+                    Object.assign(a, extracted);
+                }
+                if (r.length > 1)
+                    a.sigAlts = r.slice(1);
+            }));
+        }
+        else if (a.type === "event") {
+            promises.push(signatureLookup.loadEvents(a.hash).then((r) => {
+                if (r.length >= 1) {
+                    a.sig = r[0];
+                    // Extract as much metadata as it can from the signature
+                    Object.assign(a, AbiEvent.from("function " + a.sig));
+                }
+                if (r.length > 1)
+                    a.sigAlts = r.slice(1);
+            }));
+        }
+    }
+    // Aggregate signatureLookup promises and their errors, if any
+    const promiseResults = await Promise.allSettled(promises);
+    const rejectedPromises = promiseResults.filter((r) => r.status === "rejected");
+    if (rejectedPromises.length > 0) {
+        const cause = rejectedPromises.length === 1
+            ? rejectedPromises[0].reason
+            : new AggregateError(rejectedPromises.map((r) => r.reason));
+        throw new errors.AutoloadError(`Failed to fetch signatures due to loader error: ${cause.message}`, {
+            context: { address },
+            cause,
+        });
+    }
+    return result;
+}
+function stripUnreliableABI(abi) {
+    const r = [];
+    for (const a of abi) {
+        if (a.type !== "function")
+            continue;
+        r.push({
+            type: "function",
+            selector: a.selector,
+        });
+    }
+    return r;
+}
+function pruneFacets(facets, abis) {
+    const r = [];
+    for (const [addr, abi] of Object.entries(abis)) {
+        const allowSelectors = new Set(facets[addr]);
+        if (allowSelectors.size === 0) {
+            // Skip pruning if the mapping is empty
+            r.push(...abi);
+            continue;
+        }
+        for (let a of abi) {
+            if (a.type !== "function") {
+                r.push(a);
+                continue;
+            }
+            a = a;
+            let selector = a.selector;
+            if (selector === undefined && a.name) {
+                selector = AbiFunction.getSelector(a);
+            }
+            if (allowSelectors.has(selector)) {
+                r.push(a);
+            }
+        }
+    }
+    return r;
+}
+//# sourceMappingURL=auto.js.map
