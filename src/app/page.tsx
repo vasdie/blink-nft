@@ -1,11 +1,8 @@
-// force redeploy
+import MintNFT from "@/components/MintNFT";
 
-import { MintNFT } from "@/components/MintNFT";
-
-export default function HomePage() {
+export default function Home() {
   return (
     <main>
-      <h1>Mint your Blink</h1>
       <MintNFT />
     </main>
   );
