@@ -2,7 +2,7 @@
 
 export function MintNFT() {
   return (
-    <div>
+    <div style={{ marginTop: "1rem" }}>
       <p>🔥 Mint button loaded</p>
     </div>
   );
