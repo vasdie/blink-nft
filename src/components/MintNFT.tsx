@@ -1,21 +1,25 @@
 "use client";
 
-import { useContractWrite } from 'wagmi';
+import { useWriteContract } from 'wagmi';
 import { CONTRACT_ADDRESS, ABI } from '@/contract';
 
 export default function MintNFT() {
-  const { data, isLoading, write } = useContractWrite({
-    address: CONTRACT_ADDRESS,
-    abi: ABI,
-    functionName: "mint",
-  });
+  const { writeContract, data, status } = useWriteContract();
+
+  const handleMint = () => {
+    writeContract({
+      address: CONTRACT_ADDRESS,
+      abi: ABI,
+      functionName: 'mint',
+    });
+  };
 
   return (
     <div style={{ padding: "2rem" }}>
       <h2>Mint Your Blink NFT</h2>
       <button
-        onClick={() => write?.()}
-        disabled={!write || isLoading}
+        onClick={handleMint}
+        disabled={status === 'pending'}
         style={{
           marginTop: "1rem",
           padding: "0.6rem 1.2rem",
@@ -27,12 +31,12 @@ export default function MintNFT() {
           cursor: "pointer",
         }}
       >
-        {isLoading ? "Minting..." : "Mint NFT"}
+        {status === 'pending' ? "Minting..." : "Mint NFT"}
       </button>
 
-      {data?.hash && (
+      {data && (
         <p style={{ marginTop: "1rem", color: "#22c55e" }}>
-          ✅ Transaction sent! Hash: {data.hash}
+          ✅ Transaction sent! Hash: {data}
         </p>
       )}
     </div>
