@@ -1,3 +1,5 @@
+// force redeploy
+
 import { MintNFT } from "@/components/MintNFT";
 
 export default function HomePage() {
