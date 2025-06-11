@@ -1,4 +1,4 @@
-import { MintNFT } from "@/components/mint";
+import MintNFT from "@/components/MintNFT";
 
 export default function BlinkPage() {
   return (
